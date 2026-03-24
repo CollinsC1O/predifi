@@ -1514,7 +1514,7 @@ impl PredifiContract {
         // if pool.state != MarketState::Active || pool.resolved || pool.canceled {
         //     return Err(PredifiError::InvalidPoolState);
         // }
-        if !Self::is_pool_active(&pool){
+        if !Self::is_pool_active(&pool) {
             return Err(PredifiError::InvalidPoolState);
         }
 
@@ -1577,7 +1577,7 @@ impl PredifiContract {
         //     return Err(PredifiError::InvalidPoolState);
         // }
         if !Self::is_pool_active(&pool) {
-            return Err(PredifiError::InvalidPoolState)
+            return Err(PredifiError::InvalidPoolState);
         }
 
         let current_time = env.ledger().timestamp();
@@ -1745,7 +1745,7 @@ impl PredifiContract {
         if pool.resolved {
             return Err(PredifiError::PoolNotResolved);
         }
-        
+
         // Prevent double cancellation
         assert!(!pool.canceled, "Pool already canceled");
         // Verify state transition validity (INV-2)

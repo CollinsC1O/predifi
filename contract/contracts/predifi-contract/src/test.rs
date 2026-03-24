@@ -3714,7 +3714,7 @@ fn test_is_contract_paused_independent_per_instance() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// is_pool_active Helper Tests 
+// is_pool_active Helper Tests
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// is_pool_active returns true for a freshly created pool.
