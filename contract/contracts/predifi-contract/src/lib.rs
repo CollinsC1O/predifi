@@ -1,6 +1,8 @@
 #![no_std]
 #![allow(clippy::too_many_arguments)]
 
+#[cfg(test)]
+mod payout_proptests;
 mod price_feed;
 mod price_feed_simple;
 mod safe_math;
@@ -171,6 +173,10 @@ pub enum PredifiError {
     StakeBelowMinimum = 107,
     /// Stake amount exceeds the pool maximum.
     StakeAboveMaximum = 108,
+    /// The fee basis points exceed the maximum allowed value (10000).
+    InvalidFeeBps = 93,
+    /// An arithmetic overflow, underflow, or division by zero occurred.
+    ArithmeticError = 110,
 }
 
 /// Represents the current state of a prediction market.
@@ -274,6 +280,7 @@ pub struct Pool {
     pub whitelist_key: Option<Symbol>,
     /// Human-readable labels for each outcome (length must equal options_count).
     pub outcome_descriptions: Vec<String>,
+    pub fee_bps: u32,
 }
 
 /// Configuration parameters for creating a prediction pool.
@@ -348,6 +355,19 @@ pub struct Config {
     pub resolution_delay: u64,
     /// Minimum pool duration in seconds.
     pub min_pool_duration: u64,
+}
+
+/// Represents a single tier in the dynamic fee system.
+///
+/// Tiers are applied based on the total stake (volume) of the pool at resolution time.
+/// Higher volumes typically result in lower fee percentages to encourage participation.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeeTier {
+    /// The total stake threshold at or above which this tier applies.
+    pub stake_threshold: i128,
+    /// The fee in basis points to apply for this tier (0-10,000).
+    pub fee_bps: u32,
 }
 
 /// Detailed information about a user's prediction in a specific pool.
@@ -444,6 +464,7 @@ pub enum DataKey {
     PriceCondition(u64),
     /// Latest price feed data: PriceFeed(feed_pair) -> (price, confidence, timestamp, expires_at)
     PriceFeed(Symbol),
+    FeeTiers,
 }
 
 /// Represents a user's prediction in a pool.
@@ -488,6 +509,13 @@ pub struct UnpauseEvent {
 pub struct FeeUpdateEvent {
     pub admin: Address,
     pub fee_bps: u32,
+}
+
+#[contractevent(topics = ["fee_tiers_update"])]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeeTiersUpdateEvent {
+    pub admin: Address,
+    pub tiers_count: u32,
 }
 
 #[contractevent(topics = ["treasury_update"])]
@@ -854,6 +882,16 @@ impl PredifiContract {
         fee_bps <= 10_000
     }
 
+    /// Pure: Check if a pool is currently active.
+    /// A pool is active iff it has not been resolved, not been canceled,
+    /// and its state is explicitly `MarketState::Active`.
+    ///
+    /// PRE: pool is a valid Pool instance
+    /// POST: returns true only when all three conditions hold simultaneously
+    fn is_pool_active(pool: &Pool) -> bool {
+        !pool.resolved && !pool.canceled && pool.state == MarketState::Active
+    }
+
     /// Pure: Initialize outcome stakes vector with zeros
     /// Used for markets with many outcomes (e.g., 32+ teams tournament)
     #[allow(dead_code)]
@@ -952,6 +990,57 @@ impl PredifiContract {
         let config = Self::get_config(env);
         if !Self::has_role(env, &config.access_control, user, role) {
             return Err(PredifiError::Unauthorized);
+        }
+        Ok(())
+    }
+
+    fn require_admin_role(
+        env: &Env,
+        admin: &Address,
+        operation: &'static str,
+    ) -> Result<(), PredifiError> {
+        if let Err(e) = Self::require_role(env, admin, 0) {
+            UnauthorizedAdminAttemptEvent {
+                caller: admin.clone(),
+                operation: Symbol::new(env, operation),
+                timestamp: env.ledger().timestamp(),
+            }
+            .publish(env);
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    fn require_operator_role_for_resolution(
+        env: &Env,
+        operator: &Address,
+        pool_id: u64,
+    ) -> Result<(), PredifiError> {
+        if let Err(e) = Self::require_role(env, operator, 1) {
+            UnauthorizedResolveAttemptEvent {
+                caller: operator.clone(),
+                pool_id,
+                timestamp: env.ledger().timestamp(),
+            }
+            .publish(env);
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    fn require_oracle_role_for_resolution(
+        env: &Env,
+        oracle: &Address,
+        pool_id: u64,
+    ) -> Result<(), PredifiError> {
+        if let Err(e) = Self::require_role(env, oracle, 3) {
+            UnauthorizedResolveAttemptEvent {
+                caller: oracle.clone(),
+                pool_id,
+                timestamp: env.ledger().timestamp(),
+            }
+            .publish(env);
+            return Err(e);
         }
         Ok(())
     }
@@ -1123,13 +1212,7 @@ impl PredifiContract {
     /// Pause the contract. Only callable by Admin (role 0).
     pub fn pause(env: Env, admin: Address) {
         admin.require_auth();
-        if Self::require_role(&env, &admin, 0).is_err() {
-            UnauthorizedAdminAttemptEvent {
-                caller: admin,
-                operation: Symbol::new(&env, "pause"),
-                timestamp: env.ledger().timestamp(),
-            }
-            .publish(&env);
+        if Self::require_admin_role(&env, &admin, "pause").is_err() {
             panic!("Unauthorized: missing required role");
         }
         env.storage().instance().set(&DataKey::Paused, &true);
@@ -1148,13 +1231,7 @@ impl PredifiContract {
     /// Unpause the contract. Only callable by Admin (role 0).
     pub fn unpause(env: Env, admin: Address) {
         admin.require_auth();
-        if Self::require_role(&env, &admin, 0).is_err() {
-            UnauthorizedAdminAttemptEvent {
-                caller: admin,
-                operation: Symbol::new(&env, "unpause"),
-                timestamp: env.ledger().timestamp(),
-            }
-            .publish(&env);
+        if Self::require_admin_role(&env, &admin, "unpause").is_err() {
             panic!("Unauthorized: missing required role");
         }
         env.storage().instance().set(&DataKey::Paused, &false);
@@ -1189,15 +1266,7 @@ impl PredifiContract {
     pub fn set_fee_bps(env: Env, admin: Address, fee_bps: u32) -> Result<(), PredifiError> {
         Self::require_not_paused(&env);
         admin.require_auth();
-        if let Err(e) = Self::require_role(&env, &admin, 0) {
-            UnauthorizedAdminAttemptEvent {
-                caller: admin,
-                operation: Symbol::new(&env, "set_fee_bps"),
-                timestamp: env.ledger().timestamp(),
-            }
-            .publish(&env);
-            return Err(e);
-        }
+        Self::require_admin_role(&env, &admin, "set_fee_bps")?;
         assert!(Self::is_valid_fee_bps(fee_bps), "fee_bps exceeds 10000");
         let mut config = Self::get_config(&env);
         config.fee_bps = fee_bps;
@@ -1212,15 +1281,7 @@ impl PredifiContract {
     pub fn set_treasury(env: Env, admin: Address, treasury: Address) -> Result<(), PredifiError> {
         Self::require_not_paused(&env);
         admin.require_auth();
-        if let Err(e) = Self::require_role(&env, &admin, 0) {
-            UnauthorizedAdminAttemptEvent {
-                caller: admin,
-                operation: Symbol::new(&env, "set_treasury"),
-                timestamp: env.ledger().timestamp(),
-            }
-            .publish(&env);
-            return Err(e);
-        }
+        Self::require_admin_role(&env, &admin, "set_treasury")?;
         let mut config = Self::get_config(&env);
         config.treasury = treasury.clone();
         env.storage().instance().set(&DataKey::Config, &config);
@@ -1234,15 +1295,7 @@ impl PredifiContract {
     pub fn set_resolution_delay(env: Env, admin: Address, delay: u64) -> Result<(), PredifiError> {
         Self::require_not_paused(&env);
         admin.require_auth();
-        if let Err(e) = Self::require_role(&env, &admin, 0) {
-            UnauthorizedAdminAttemptEvent {
-                caller: admin,
-                operation: Symbol::new(&env, "set_resolution_delay"),
-                timestamp: env.ledger().timestamp(),
-            }
-            .publish(&env);
-            return Err(e);
-        }
+        Self::require_admin_role(&env, &admin, "set_resolution_delay")?;
         let mut config = Self::get_config(&env);
         config.resolution_delay = delay;
         env.storage().instance().set(&DataKey::Config, &config);
@@ -1260,15 +1313,7 @@ impl PredifiContract {
     ) -> Result<(), PredifiError> {
         Self::require_not_paused(&env);
         admin.require_auth();
-        if let Err(e) = Self::require_role(&env, &admin, 0) {
-            UnauthorizedAdminAttemptEvent {
-                caller: admin,
-                operation: Symbol::new(&env, "set_min_pool_duration"),
-                timestamp: env.ledger().timestamp(),
-            }
-            .publish(&env);
-            return Err(e);
-        }
+        Self::require_admin_role(&env, &admin, "set_min_pool_duration")?;
 
         let mut config = Self::get_config(&env);
         config.min_pool_duration = duration;
@@ -1288,15 +1333,7 @@ impl PredifiContract {
     ) -> Result<(), PredifiError> {
         Self::require_not_paused(&env);
         admin.require_auth();
-        if let Err(e) = Self::require_role(&env, &admin, 0) {
-            UnauthorizedAdminAttemptEvent {
-                caller: admin,
-                operation: Symbol::new(&env, "set_referral_cut_bps"),
-                timestamp: env.ledger().timestamp(),
-            }
-            .publish(&env);
-            return Err(e);
-        }
+        Self::require_admin_role(&env, &admin, "set_referral_cut_bps")?;
         assert!(
             referral_cut_bps <= 10_000,
             "referral_cut_bps must be at most 10000"
@@ -1316,15 +1353,7 @@ impl PredifiContract {
     ) -> Result<(), PredifiError> {
         Self::require_not_paused(&env);
         admin.require_auth();
-        if let Err(e) = Self::require_role(&env, &admin, 0) {
-            UnauthorizedAdminAttemptEvent {
-                caller: admin,
-                operation: Symbol::new(&env, "add_token_to_whitelist"),
-                timestamp: env.ledger().timestamp(),
-            }
-            .publish(&env);
-            return Err(e);
-        }
+        Self::require_admin_role(&env, &admin, "add_token_to_whitelist")?;
         let key = DataKey::TokenWl(token.clone());
         env.storage().persistent().set(&key, &true);
         Self::extend_persistent(&env, &key);
@@ -1345,15 +1374,7 @@ impl PredifiContract {
     ) -> Result<(), PredifiError> {
         Self::require_not_paused(&env);
         admin.require_auth();
-        if let Err(e) = Self::require_role(&env, &admin, 0) {
-            UnauthorizedAdminAttemptEvent {
-                caller: admin,
-                operation: Symbol::new(&env, "remove_token_from_whitelist"),
-                timestamp: env.ledger().timestamp(),
-            }
-            .publish(&env);
-            return Err(e);
-        }
+        Self::require_admin_role(&env, &admin, "remove_token_from_whitelist")?;
         let key = DataKey::TokenWl(token.clone());
         env.storage().persistent().remove(&key);
 
@@ -1372,7 +1393,7 @@ impl PredifiContract {
         new_wasm_hash: BytesN<32>,
     ) -> Result<(), PredifiError> {
         admin.require_auth();
-        Self::require_role(&env, &admin, 0)?;
+        Self::require_admin_role(&env, &admin, "upgrade_contract")?;
 
         env.deployer()
             .update_current_contract_wasm(new_wasm_hash.clone());
@@ -1389,7 +1410,7 @@ impl PredifiContract {
     /// Placeholder for post-upgrade migration logic.
     pub fn migrate_state(env: Env, admin: Address) -> Result<(), PredifiError> {
         admin.require_auth();
-        Self::require_role(&env, &admin, 0)?;
+        Self::require_admin_role(&env, &admin, "migrate_state")?;
         // Initial implementation has no state migration needed.
         Ok(())
     }
@@ -1442,15 +1463,7 @@ impl PredifiContract {
         admin.require_auth();
 
         // Verify admin role
-        if let Err(e) = Self::require_role(&env, &admin, 0) {
-            UnauthorizedAdminAttemptEvent {
-                caller: admin,
-                operation: Symbol::new(&env, "withdraw_treasury"),
-                timestamp: env.ledger().timestamp(),
-            }
-            .publish(&env);
-            return Err(e);
-        }
+        Self::require_admin_role(&env, &admin, "withdraw_treasury")?;
 
         // Validate amount
         if amount <= 0 {
@@ -1617,6 +1630,7 @@ impl PredifiContract {
             private: config.private,
             whitelist_key: config.whitelist_key.clone(),
             outcome_descriptions: config.outcome_descriptions.clone(),
+            fee_bps: 0, // Will be set at resolution
         };
 
         let pool_key = DataKey::Pool(pool_id);
@@ -1719,9 +1733,13 @@ impl PredifiContract {
         }
 
         // Pool must still be active and not ended
-        if pool.state != MarketState::Active || pool.resolved || pool.canceled {
+        // if pool.state != MarketState::Active || pool.resolved || pool.canceled {
+        //     return Err(PredifiError::InvalidPoolState);
+        // }
+        if !Self::is_pool_active(&pool){
             return Err(PredifiError::InvalidPoolState);
         }
+
         assert!(env.ledger().timestamp() < pool.end_time, "Pool has ended");
 
         // Must not set a cap below what is already staked
@@ -1757,16 +1775,7 @@ impl PredifiContract {
     ) -> Result<(), PredifiError> {
         Self::require_not_paused(&env);
         operator.require_auth();
-        if let Err(e) = Self::require_role(&env, &operator, 1) {
-            // 🔴 HIGH ALERT: unauthorized attempt to resolve a pool.
-            UnauthorizedResolveAttemptEvent {
-                caller: operator,
-                pool_id,
-                timestamp: env.ledger().timestamp(),
-            }
-            .publish(&env);
-            return Err(e);
-        }
+        Self::require_operator_role_for_resolution(&env, &operator, pool_id)?;
 
         let pool_key = DataKey::Pool(pool_id);
         let mut pool: Pool = env
@@ -1777,8 +1786,11 @@ impl PredifiContract {
 
         assert!(!pool.resolved, "Pool already resolved");
         assert!(!pool.canceled, "Cannot resolve a canceled pool");
-        if pool.state != MarketState::Active {
-            return Err(PredifiError::InvalidPoolState);
+        // if pool.state != MarketState::Active {
+        //     return Err(PredifiError::InvalidPoolState);
+        // }
+        if !Self::is_pool_active(&pool) {
+            return Err(PredifiError::InvalidPoolState)
         }
 
         let current_time = env.ledger().timestamp();
@@ -1856,6 +1868,7 @@ impl PredifiContract {
             pool.state = MarketState::Resolved;
             pool.resolved = true;
             pool.outcome = outcome;
+            pool.fee_bps = Self::calculate_dynamic_fee(&env, &pool);
 
             env.storage().persistent().set(&pool_key, &pool);
 
@@ -1949,14 +1962,17 @@ impl PredifiContract {
         if pool.resolved {
             return Err(PredifiError::PoolNotResolved);
         }
-
+        
         // Prevent double cancellation
         assert!(!pool.canceled, "Pool already canceled");
         // Verify state transition validity (INV-2)
-        assert!(
-            Self::is_valid_state_transition(pool.state, MarketState::Canceled),
-            "Invalid state transition"
-        );
+        // assert!(
+        //     Self::is_valid_state_transition(pool.state, MarketState::Canceled),
+        //     "Invalid state transition"
+        // );
+        if !Self::is_pool_active(&pool) {
+            return Err(PredifiError::InvalidPoolState);
+        }
 
         pool.state = MarketState::Canceled;
 
@@ -2018,7 +2034,10 @@ impl PredifiContract {
 
         assert!(!pool.resolved, "Pool already resolved");
         assert!(!pool.canceled, "Cannot place prediction on canceled pool");
-        assert!(pool.state == MarketState::Active, "Pool is not active");
+        // assert!(pool.state == MarketState::Active, "Pool is not active");
+        if !Self::is_pool_active(&pool) {
+            panic!("Pool is not active");
+        }
         assert!(env.ledger().timestamp() < pool.end_time, "Pool has ended");
 
         // Check private pool authorization
@@ -2263,9 +2282,14 @@ impl PredifiContract {
                 return Ok(0);
             }
 
-            // Protocol fee: deducted from pool before distribution (flat fee_bps, no dependency on 317)
-            let config = Self::get_config(&env);
-            let fee_bps_i = config.fee_bps as i128;
+            // Protocol fee: deducted from pool before distribution
+            // Use pool-specific fee (calculated at resolution) if available, else fallback to global
+            let fee_bps_i = if pool.fee_bps > 0 || pool.state == MarketState::Resolved {
+                pool.fee_bps as i128
+            } else {
+                let config = Self::get_config(&env);
+                config.fee_bps as i128
+            };
             let protocol_fee_total =
                 SafeMath::percentage(pool.total_stake, fee_bps_i, RoundingMode::ProtocolFavor)
                     .map_err(|_| PredifiError::InvalidAmount)?;
@@ -2915,6 +2939,7 @@ impl PredifiContract {
         pool.state = MarketState::Resolved;
         pool.resolved = true;
         pool.outcome = outcome;
+        pool.fee_bps = Self::calculate_dynamic_fee(&env, &pool);
 
         env.storage().persistent().set(&pool_key, &pool);
         Self::bump_ttl(&env, &pool_key);
@@ -2927,6 +2952,59 @@ impl PredifiContract {
         .publish(&env);
 
         Ok(())
+    }
+    pub fn set_fee_tiers(
+        env: Env,
+        admin: Address,
+        tiers: Vec<FeeTier>,
+    ) -> Result<(), PredifiError> {
+        Self::require_not_paused(&env);
+        admin.require_auth();
+        Self::require_admin_role(&env, &admin, "set_fee_tiers")?;
+
+        for i in 0..tiers.len() {
+            if let Some(tier) = tiers.get(i) {
+                if tier.fee_bps > 10_000 {
+                    return Err(PredifiError::InvalidFeeBps);
+                }
+            }
+        }
+
+        env.storage().persistent().set(&DataKey::FeeTiers, &tiers);
+        Self::bump_ttl(&env, &DataKey::FeeTiers);
+
+        FeeTiersUpdateEvent {
+            admin,
+            tiers_count: tiers.len(),
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    pub fn get_fee_tiers(env: Env) -> Vec<FeeTier> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::FeeTiers)
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    fn calculate_dynamic_fee(env: &Env, pool: &Pool) -> u32 {
+        let config = Self::get_config(env);
+        let tiers = Self::get_fee_tiers(env.clone());
+        let mut applied_fee = config.fee_bps;
+
+        let mut max_threshold = -1i128;
+        for i in 0..tiers.len() {
+            if let Some(tier) = tiers.get(i) {
+                if pool.total_stake >= tier.stake_threshold && tier.stake_threshold > max_threshold
+                {
+                    max_threshold = tier.stake_threshold;
+                    applied_fee = tier.fee_bps;
+                }
+            }
+        }
+        applied_fee
     }
 }
 
@@ -2942,17 +3020,7 @@ impl OracleCallback for PredifiContract {
         Self::require_not_paused(&env);
         oracle.require_auth();
 
-        // Check authorization: oracle must have role 3
-        if let Err(e) = Self::require_role(&env, &oracle, 3) {
-            // 🔴 HIGH ALERT: unauthorized attempt to resolve a pool by an oracle
-            UnauthorizedResolveAttemptEvent {
-                caller: oracle,
-                pool_id,
-                timestamp: env.ledger().timestamp(),
-            }
-            .publish(&env);
-            return Err(e);
-        }
+        Self::require_oracle_role_for_resolution(&env, &oracle, pool_id)?;
 
         let pool_key = DataKey::Pool(pool_id);
         let mut pool: Pool = env
@@ -2963,7 +3031,10 @@ impl OracleCallback for PredifiContract {
 
         assert!(!pool.resolved, "Pool already resolved");
         assert!(!pool.canceled, "Cannot resolve a canceled pool");
-        if pool.state != MarketState::Active {
+        // if pool.state != MarketState::Active {
+        //     return Err(PredifiError::InvalidPoolState);
+        // }
+        if !Self::is_pool_active(&pool) {
             return Err(PredifiError::InvalidPoolState);
         }
 
@@ -3050,6 +3121,7 @@ impl OracleCallback for PredifiContract {
             pool.state = MarketState::Resolved;
             pool.resolved = true;
             pool.outcome = outcome;
+            pool.fee_bps = Self::calculate_dynamic_fee(&env, &pool);
 
             env.storage().persistent().set(&pool_key, &pool);
             Self::bump_ttl(&env, &pool_key);
@@ -3084,5 +3156,6 @@ impl OracleCallback for PredifiContract {
     }
 }
 
+mod fee_tiers_test;
 mod integration_test;
 mod test;
